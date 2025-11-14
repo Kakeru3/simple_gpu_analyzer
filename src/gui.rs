@@ -48,13 +48,15 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
     struct UiState {
         fft: Arc<Mutex<Vec<f32>>>,
         prev_fft: Vec<f32>,
+        min_db: f32,
+        max_db: f32,
     }
 
     impl UiState {
         fn new(fft: Arc<Mutex<Vec<f32>>>) -> Self {
             // initialize prev_fft from current buffer (or empty)
             let initial = fft.lock().clone();
-            Self { fft, prev_fft: initial }
+            Self { fft, prev_fft: initial, min_db: -16.0, max_db: 64.0 }
         }
     }
 
@@ -70,6 +72,13 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
         CentralPanel::default().show(ctx, |ui| {
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                 ui.heading("GPU FFT Spectrum (wgpu via PaintCallback)");
+
+                // dB range sliders
+                ui.horizontal(|ui| {
+                    ui.label("dB range:");
+                    ui.add(egui::Slider::new(&mut state.min_db, -100.0..=0.0).text("min dB"));
+                    ui.add(egui::Slider::new(&mut state.max_db, 0.0..=60.0).text("max dB"));
+                });
 
                 // allocate area
                 let desired = egui::vec2(ui.available_width(), 260.0);
@@ -116,6 +125,8 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                         sample_rate,
                         fft_size,
                         min_freq,
+                        min_db: state.min_db,
+                        max_db: state.max_db,
                     },
                 );
 
@@ -166,6 +177,23 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                     );
                 }
 
+                // Horizontal dB reference lines (centered at 0 dB)
+                // 0 dB at center of rect, then +6, +12 above and -6, -12 below.
+                let scale_factor = 8.0_f32; // ピクセルあたりのdb(幅)
+                let y0 = rect.top() + rect.height() / 2.0;
+                let db_lines = [12.0_f32, 6.0, 0.0, -6.0, -12.0];
+                for &db in &db_lines {
+                    let y = y0 - db * scale_factor;
+                    let p1 = egui::pos2(rect.left(), y);
+                    let p2 = egui::pos2(rect.right(), y);
+                    let color = if db == 0.0 {
+                        egui::Color32::from_rgb(255, 200, 50) // highlight 0dB
+                    } else {
+                        egui::Color32::from_gray(100)
+                    };
+                    ui.painter().line_segment([p1, p2], egui::Stroke::new(1.0, color));
+                }
+
                 // CPU fallback line (log-frequency mapping with per-pixel interpolation)
                 if fft_snapshot.len() >= 2 {
                     let w = rect.width();
@@ -181,7 +209,14 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                     let log_max = max_f.log10();
 
                     let n_pixels = w.max(2.0) as usize;
-                    let mut points: Vec<egui::Pos2> = Vec::with_capacity(n_pixels);
+
+                    // Simple thresholding: use a small normalized threshold so low
+                    // levels are not accidentally filtered out by complex logic.
+                    // This is intentionally simple and easy to remove later.
+                    let display_threshold = 0.0005_f32; // normalized (0..1)
+
+                    // Build per-pixel Option points
+                    let mut pixel_points: Vec<Option<egui::Pos2>> = vec![None; n_pixels];
 
                     for px in 0..n_pixels {
                         let t = px as f32 / (n_pixels - 1) as f32;
@@ -206,15 +241,60 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                         };
 
                         let val = v0 * (1.0 - frac) + v1 * frac;
+                        let mag_db = 20.0 * val.max(1e-12).log10();
+                        let denom = (state.max_db - state.min_db).max(1e-6);
+                        let mut norm = ((mag_db - state.min_db) / denom).clamp(0.0, 1.0);
                         let x = rect.left() + t * w;
-                        let y = rect.bottom() - val.clamp(0.0, 1.0) * h;
-                        points.push(egui::pos2(x, y));
-                    }
+                        let mut y = rect.bottom() - norm * h;
+                        // snap near-zero to exact bottom for visual continuity
+                        if norm <= 1e-6 {
+                            norm = 0.0;
+                            y = rect.bottom();
+                        }
 
-                    ui.painter().add(egui::Shape::line(
-                        points,
-                        egui::Stroke::new(1.6, egui::Color32::from_rgb(0, 200, 255)),
-                    ));
+                        if norm > display_threshold {
+                            pixel_points[px] = Some(egui::pos2(x, y));
+                        }
+                    }
+                    
+
+                    // find contiguous segments of Some points and draw each segment
+                    let stroke = egui::Stroke::new(1.6, egui::Color32::from_rgb(0, 200, 255));
+                    let mut idx = 0usize;
+                    while idx < n_pixels {
+                        // skip None
+                        while idx < n_pixels && pixel_points[idx].is_none() {
+                            idx += 1;
+                        }
+                        if idx >= n_pixels {
+                            break;
+                        }
+                        let start = idx;
+                        while idx < n_pixels && pixel_points[idx].is_some() {
+                            idx += 1;
+                        }
+                        let end = idx - 1; // inclusive
+
+                        let seg_len = end - start + 1;
+                        if seg_len < 2 {
+                            // skip isolated single points to avoid artifacts
+                            continue;
+                        }
+
+                        // collect visible points
+                        let mut seg_points: Vec<egui::Pos2> = Vec::with_capacity(seg_len);
+                        for p in start..=end {
+                            seg_points.push(pixel_points[p].unwrap());
+                        }
+
+                        // draw the visible polyline
+                        ui.painter().add(egui::Shape::line(seg_points.clone(), stroke));
+
+                        // Do not draw vertical drops inside the visible rect for
+                        // off-screen frequencies — leaving the visible polyline
+                        // truncated at its last visible point gives the impression
+                        // that the rest falls off-screen.
+                    }
                 }
             });
         });
@@ -231,6 +311,8 @@ struct SpectrumPainter {
     sample_rate: f32,     // e.g. 44100.0
     fft_size: usize,      // e.g. 4096 etc. (we heuristically use data.len()*2 if not provided)
     min_freq: f32,        // lower bound for log mapping (e.g. 20.0)
+    min_db: f32,
+    max_db: f32,
 }
 
 // Pipeline cache
@@ -362,7 +444,7 @@ impl egui_wgpu::CallbackTrait for SpectrumPainter {
 
             // convert magnitude (assumed linear magnitude) to dB then normalize to 0..1
             let mag_db = 20.0 * mag.max(1e-12).log10();
-            let norm = ((mag_db + 80.0) / 80.0).clamp(0.0, 1.0);
+            let norm = ((mag_db - self.min_db) / (self.max_db - self.min_db)).clamp(0.0, 1.0);
 
             // y in pixels (top=clip_min.y)
             let px_y = clip_min.y + (1.0 - norm) * px_h;

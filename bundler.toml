@@ -4,5 +4,5 @@
 # [package_name]
 # name = "Human Readable Plugin Name"  # defaults to <package_name>
 
-[gain]
-name = "gain"
+[simple_gpu_analyzer]
+name = "simple_gpu_analyzer"

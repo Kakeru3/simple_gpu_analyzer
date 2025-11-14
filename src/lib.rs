@@ -65,17 +65,8 @@ impl Plugin for SimpleGpuAnalyzer {
             // compute FFT magnitudes (simple)
             let spec = compute_magnitude_spectrum(&samples);
 
-            // normalise to 0..1 (log dB mapping helps visualization)
-            let mapped: Vec<f32> = spec
-                .into_iter()
-                .map(|mag| {
-                    // convert magnitude to dB (avoid log(0))
-                    let amp = mag.max(1e-10);
-                    let db = 20.0 * amp.log10();
-                    // map db range (-80..0) to 0..1
-                    ((db + 80.0) / 80.0).clamp(0.0, 1.0)
-                })
-                .collect();
+            // Keep linear magnitudes (raw) for the UI/GPU to perform dB mapping there.
+            let mapped: Vec<f32> = spec;
 
             // store (truncate/pad into shared vec)
             let mut guard = self.fft_data.lock();
