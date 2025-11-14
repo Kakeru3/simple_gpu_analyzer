@@ -47,11 +47,14 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
     // UI state carries shared FFT data
     struct UiState {
         fft: Arc<Mutex<Vec<f32>>>,
+        prev_fft: Vec<f32>,
     }
 
     impl UiState {
         fn new(fft: Arc<Mutex<Vec<f32>>>) -> Self {
-            Self { fft }
+            // initialize prev_fft from current buffer (or empty)
+            let initial = fft.lock().clone();
+            Self { fft, prev_fft: initial }
         }
     }
 
@@ -77,8 +80,27 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
 
                 // snapshot fft
                 let fft_snapshot = state.fft.lock().clone();
-                // Make a clone for painter
-                let fft_for_painter = fft_snapshot.clone();
+
+                // FRAME-TO-FRAME ATTACK/RELEASE SMOOTHING
+                // Immediate attack: if current > prev then take current.
+                // Smooth release: otherwise interpolate towards current (alpha * prev + (1-alpha) * cur).
+                let alpha = 0.85_f32; // release smoothing factor (0..1). Larger => slower decay.
+                // Ensure prev buffer matches length
+                if state.prev_fft.len() != fft_snapshot.len() {
+                    state.prev_fft.resize(fft_snapshot.len(), 0.0);
+                }
+                let mut frame_smoothed = vec![0.0_f32; fft_snapshot.len()];
+                for i in 0..fft_snapshot.len() {
+                    let cur = fft_snapshot[i];
+                    let prev = state.prev_fft[i];
+                    let val = if cur > prev { cur } else { alpha * prev + (1.0 - alpha) * cur };
+                    frame_smoothed[i] = val;
+                    // update prev for next frame
+                    state.prev_fft[i] = val;
+                }
+
+                // Make a clone for painter (smoothed)
+                let fft_for_painter = frame_smoothed.clone();
 
                 // Create the PaintCallback via egui_wgpu::Callback::new_paint_callback
                 // SpectrumPainter now gets data + parameters for log mapping
@@ -98,6 +120,30 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                 );
 
                 ui.painter().add(cb);
+
+                // Smooth FFT (1/6 octave band average) for nicer curves
+                // Apply band averaging to the frame-smoothed data to produce final plotted smoothing.
+                let smoothed_fft = {
+                    let n_bins = frame_smoothed.len();
+                    let mut out = vec![0.0f32; n_bins];
+                    let band_width = 2f32.powf(1.0 / 6.0);
+                    let sr = sample_rate;
+                    let fft_n = fft_size;
+                    for i in 0..n_bins {
+                        let freq_i = (i as f32 + 0.5) * (sr / fft_n as f32);
+                        let mut sum = 0.0f32;
+                        let mut count: usize = 0;
+                        for j in 0..n_bins {
+                            let freq_j = (j as f32 + 0.5) * (sr / fft_n as f32);
+                            if freq_j >= freq_i / band_width && freq_j <= freq_i * band_width {
+                                sum += frame_smoothed[j];
+                                count += 1;
+                            }
+                        }
+                        out[i] = if count > 0 { sum / (count as f32) } else { 0.0 };
+                    }
+                    out
+                };
 
                 // CPU-side log-frequency grid (fallback / visible reference)
                 let max_f = (sample_rate / 2.0).max(min_freq + 1.0);
@@ -148,13 +194,13 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                         let bin_idx1 = bin_pos.ceil() as isize;
                         let frac = bin_pos - bin_idx0 as f32;
 
-                        let v0 = if bin_idx0 >= 0 && (bin_idx0 as usize) < fft_snapshot.len() {
-                            fft_snapshot[bin_idx0 as usize]
+                        let v0 = if bin_idx0 >= 0 && (bin_idx0 as usize) < smoothed_fft.len() {
+                            smoothed_fft[bin_idx0 as usize]
                         } else {
                             0.0
                         };
-                        let v1 = if bin_idx1 >= 0 && (bin_idx1 as usize) < fft_snapshot.len() {
-                            fft_snapshot[bin_idx1 as usize]
+                        let v1 = if bin_idx1 >= 0 && (bin_idx1 as usize) < smoothed_fft.len() {
+                            smoothed_fft[bin_idx1 as usize]
                         } else {
                             0.0
                         };
