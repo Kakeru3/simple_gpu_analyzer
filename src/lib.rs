@@ -2,6 +2,7 @@ use nih_plug::prelude::*;
 use std::sync::Arc;
 use parking_lot::Mutex;
 
+mod gui;
 mod gpui;
 
 #[derive(Params)]
@@ -90,7 +91,7 @@ impl Plugin for SimpleGpuAnalyzer {
 
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         // pass the Arc shared buffer to GUI
-        gpui::create(self.fft_data.clone())
+        gui::create(self.fft_data.clone())
     }
 }
 
@@ -99,9 +100,13 @@ fn compute_magnitude_spectrum(samples: &[f32]) -> Vec<f32> {
     use rustfft::{FftPlanner, num_complex::Complex};
 
     // pick power-of-two length (use samples.len() rounded down to pow2)
+    // Zero-pad to a larger minimum FFT size to improve low-frequency resolution
     let n = samples.len().next_power_of_two();
     let n = if n > samples.len() { n / 2 } else { n };
-    let n = n.max(256); // avoid too small
+    // Increase minimum FFT size so low frequencies (eg. <100 Hz) are represented.
+    // This uses zero-padding when the captured sample window is smaller than `MIN_FFT`.
+    const MIN_FFT: usize = 2048;
+    let n = n.max(MIN_FFT);
 
     // prepare buffer (windowed)
     let mut input: Vec<Complex<f32>> = (0..n)
