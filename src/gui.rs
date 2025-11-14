@@ -120,38 +120,51 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                     );
                 }
 
-                // CPU fallback line (log-frequency mapping)
+                // CPU fallback line (log-frequency mapping with per-pixel interpolation)
                 if fft_snapshot.len() >= 2 {
-                    let points: Vec<egui::Pos2> = {
-                        let n = fft_snapshot.len();
-                        let w = rect.width();
-                        let h = rect.height();
+                    let w = rect.width();
+                    let h = rect.height();
 
-                        // parameters for mapping
-                        let sr = sample_rate; // sample rate used above
-                        let fft_n = fft_size; // fft_size set above
-                        let min_f = min_freq.max(1.0);
-                        let max_f = (sr / 2.0).max(min_f + 1.0);
+                    // parameters for mapping
+                    let sr = sample_rate; // sample rate used above
+                    let fft_n = fft_size; // fft_size set above
+                    let min_f = min_freq.max(1.0);
+                    let max_f = (sr / 2.0).max(min_f + 1.0);
 
-                        let log_min = min_f.log10();
-                        let log_max = max_f.log10();
+                    let log_min = min_f.log10();
+                    let log_max = max_f.log10();
 
-                        (0..n)
-                            .map(|i| {
-                                let freq = (i as f32 + 0.5) * (sr / fft_n as f32); // bin center freq
-                                let freq_clamped = freq.max(min_f).min(max_f);
-                                let t = if (log_max - log_min).abs() < std::f32::EPSILON {
-                                    0.0
-                                } else {
-                                    (freq_clamped.log10() - log_min) / (log_max - log_min) // 0..1
-                                };
+                    let n_pixels = w.max(2.0) as usize;
+                    let mut points: Vec<egui::Pos2> = Vec::with_capacity(n_pixels);
 
-                                let x = rect.left() + t * w;
-                                let y = rect.bottom() - fft_snapshot[i].clamp(0.0, 1.0) * h;
-                                egui::pos2(x, y)
-                            })
-                            .collect()
-                    };
+                    for px in 0..n_pixels {
+                        let t = px as f32 / (n_pixels - 1) as f32;
+                        let log_f = log_min + t * (log_max - log_min);
+                        let freq = 10f32.powf(log_f);
+
+                        // map freq to bin (centered)
+                        let bin_pos = freq / (sr / fft_n as f32) - 0.5;
+                        let bin_idx0 = bin_pos.floor() as isize;
+                        let bin_idx1 = bin_pos.ceil() as isize;
+                        let frac = bin_pos - bin_idx0 as f32;
+
+                        let v0 = if bin_idx0 >= 0 && (bin_idx0 as usize) < fft_snapshot.len() {
+                            fft_snapshot[bin_idx0 as usize]
+                        } else {
+                            0.0
+                        };
+                        let v1 = if bin_idx1 >= 0 && (bin_idx1 as usize) < fft_snapshot.len() {
+                            fft_snapshot[bin_idx1 as usize]
+                        } else {
+                            0.0
+                        };
+
+                        let val = v0 * (1.0 - frac) + v1 * frac;
+                        let x = rect.left() + t * w;
+                        let y = rect.bottom() - val.clamp(0.0, 1.0) * h;
+                        points.push(egui::pos2(x, y));
+                    }
+
                     ui.painter().add(egui::Shape::line(
                         points,
                         egui::Stroke::new(1.6, egui::Color32::from_rgb(0, 200, 255)),
