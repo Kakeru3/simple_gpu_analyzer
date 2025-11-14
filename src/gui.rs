@@ -132,28 +132,31 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
 
                 ui.painter().add(cb);
 
-                // Smooth FFT (1/6 octave band average) for nicer curves
-                // Apply band averaging to the frame-smoothed data to produce final plotted smoothing.
+                // Simple smoothing: 3-bin moving average for visual smoothing.
+                // This is far cheaper than octave-band averaging and good enough
+                // for a responsive visualization.
                 let smoothed_fft = {
-                    let n_bins = frame_smoothed.len();
-                    let mut out = vec![0.0f32; n_bins];
-                    let band_width = 2f32.powf(1.0 / 6.0);
-                    let sr = sample_rate;
-                    let fft_n = fft_size;
-                    for i in 0..n_bins {
-                        let freq_i = (i as f32 + 0.5) * (sr / fft_n as f32);
-                        let mut sum = 0.0f32;
-                        let mut count: usize = 0;
-                        for j in 0..n_bins {
-                            let freq_j = (j as f32 + 0.5) * (sr / fft_n as f32);
-                            if freq_j >= freq_i / band_width && freq_j <= freq_i * band_width {
-                                sum += frame_smoothed[j];
-                                count += 1;
+                    let n = frame_smoothed.len();
+                    if n == 0 {
+                        Vec::new()
+                    } else {
+                        let mut out = vec![0.0f32; n];
+                        for i in 0..n {
+                            // average over [i-1, i, i+1]
+                            let mut sum = frame_smoothed[i];
+                            let mut cnt = 1.0_f32;
+                            if i >= 1 {
+                                sum += frame_smoothed[i - 1];
+                                cnt += 1.0;
                             }
+                            if i + 1 < n {
+                                sum += frame_smoothed[i + 1];
+                                cnt += 1.0;
+                            }
+                            out[i] = sum / cnt;
                         }
-                        out[i] = if count > 0 { sum / (count as f32) } else { 0.0 };
+                        out
                     }
-                    out
                 };
 
                 // CPU-side log-frequency grid (fallback / visible reference)
