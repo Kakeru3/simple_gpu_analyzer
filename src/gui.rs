@@ -45,22 +45,30 @@ struct PipelineResources {
 /// create(editor) expected by your plugin code
 pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
     // UI state carries shared FFT data
-    struct UiState {
+        struct UiState {
         fft: Arc<Mutex<Vec<f32>>>,
         prev_fft: Vec<f32>,
         min_db: f32,
         max_db: f32,
+        full_scale_ref: f32,
+        calibrate_now: bool,
+            // Smoothing for the spectral display (number of bins in moving average).
+            // 1 => no smoothing, 3 => small smoothing, etc.
+            smoothing_bins: usize,
+            // If true, choose the nearest FFT bin per pixel instead of linear
+            // interpolation between bins. This makes the plot step-like.
+            // remove nearest bin interpolation to avoid boxy 90-degree verticals
     }
 
     impl UiState {
         fn new(fft: Arc<Mutex<Vec<f32>>>) -> Self {
             // initialize prev_fft from current buffer (or empty)
             let initial = fft.lock().clone();
-            Self { fft, prev_fft: initial, min_db: -16.0, max_db: 64.0 }
+            Self { fft, prev_fft: initial, min_db: -16.0, max_db: 64.0, full_scale_ref: 1.0, calibrate_now: false, smoothing_bins: 1 }
         }
     }
 
-    let egui_state = nih_plug_egui::EguiState::from_size(900, 360);
+    let egui_state = nih_plug_egui::EguiState::from_size(900, 600);
 
     // build callback (run once)
     let build = |_ctx: &egui::Context, _state: &mut UiState| {};
@@ -73,15 +81,39 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                 ui.heading("GPU FFT Spectrum (wgpu via PaintCallback)");
 
-                // dB range sliders
+                // dB range sliders + full-scale calibration
                 ui.horizontal(|ui| {
                     ui.label("dB range:");
-                    ui.add(egui::Slider::new(&mut state.min_db, -100.0..=0.0).text("min dB"));
+                    ui.add(egui::Slider::new(&mut state.min_db, -120.0..=0.0).text("min dB"));
                     ui.add(egui::Slider::new(&mut state.max_db, 0.0..=60.0).text("max dB"));
+                    ui.separator();
+                    ui.label("FS ref:");
+                    // Allow a much wider range for full-scale reference because
+                    // FFT magnitudes may not be normalized to 1.0. Hosts or windowing
+                    // can produce peak values > 4. Allow up to 1e6 here; user can
+                    // still type arbitrary values if needed.
+                    ui.add(egui::DragValue::new(&mut state.full_scale_ref).speed(0.01).range(1e-6..=1e6));
+                    if ui.button("Calibrate FS").clicked() {
+                        // schedule calibration to run after we compute smoothed_fft
+                        state.calibrate_now = true;
+                    }
+                    ui.label("(full-scale amplitude for 0 dB)");
+                });
+
+                // Controls for display smoothing (spectral smoothing only)
+                ui.horizontal(|ui| {
+                    ui.label("Spectral smoothing (bins):");
+                    // use an Int slider for the window size; min 1, max 51
+                    let mut sb = state.smoothing_bins as i32;
+                    ui.add(egui::Slider::new(&mut sb, 1..=51).text("bins"));
+                    // disable the 'nearest bin' interpolation option to avoid
+                    // boxy vertical edges; we always use linear interpolation
+                    // between bins for frequency mapping.
+                    state.smoothing_bins = sb.max(1) as usize;
                 });
 
                 // allocate area
-                let desired = egui::vec2(ui.available_width(), 260.0);
+                let desired = egui::vec2(ui.available_width(), ui.available_height());
                 let (rect, _resp) = ui.allocate_exact_size(desired, egui::Sense::hover());
 
                 // background
@@ -127,12 +159,14 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                         min_freq,
                         min_db: state.min_db,
                         max_db: state.max_db,
+                        full_scale_ref: state.full_scale_ref,
                     },
                 );
 
                 ui.painter().add(cb);
 
-                // Simple smoothing: 3-bin moving average for visual smoothing.
+                // Spectral smoothing: moving average of `smoothing_bins` centered
+                // on each bin. `smoothing_bins == 1` means no extra smoothing.
                 // This is far cheaper than octave-band averaging and good enough
                 // for a responsive visualization.
                 let smoothed_fft = {
@@ -141,24 +175,53 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                         Vec::new()
                     } else {
                         let mut out = vec![0.0f32; n];
+                        let window = state.smoothing_bins.max(1);
+                        let half = window / 2;
                         for i in 0..n {
-                            // average over [i-1, i, i+1]
-                            let mut sum = frame_smoothed[i];
-                            let mut cnt = 1.0_f32;
-                            if i >= 1 {
-                                sum += frame_smoothed[i - 1];
-                                cnt += 1.0;
+                            if window <= 1 {
+                                out[i] = frame_smoothed[i];
+                                continue;
                             }
-                            if i + 1 < n {
-                                sum += frame_smoothed[i + 1];
-                                cnt += 1.0;
+                            let start = i.saturating_sub(half);
+                            let end = (i + half).min(n - 1);
+                            let mut sum = 0.0f32;
+                            let mut cnt = 0usize;
+                            for j in start..=end {
+                                sum += frame_smoothed[j];
+                                cnt += 1;
                             }
-                            out[i] = sum / cnt;
+                            out[i] = if cnt > 0 { sum / cnt as f32 } else { 0.0 };
                         }
                         out
                     }
                 };
 
+                // If user requested calibration, use the smoothed FFT peak
+                // so the UI's "Calibrate FS" aligns with the plotted (smoothed)
+                // data rather than an instantaneous raw peak.
+                if state.calibrate_now {
+                    if !smoothed_fft.is_empty() {
+                        // Use absolute magnitudes when finding peak so negative values
+                        // do not reduce the measured full-scale reference.
+                        let peak = smoothed_fft.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+                        if peak > 1e-12 {
+                            state.full_scale_ref = peak;
+                        }
+                    }
+                    state.calibrate_now = false;
+                }
+
+                // Automatic calibration: if the observed smoothed peak grows beyond
+                // the current full-scale reference by a small margin, expand the
+                // reference automatically so 0 dB remains a clipping indicator.
+                // We use a small hysteresis (e.g. 2%) to avoid jitter from tiny peaks.
+                if !smoothed_fft.is_empty() {
+                    let observed_peak = smoothed_fft.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
+                    let grow_threshold = 1.02_f32; // require >2% growth to update
+                    if observed_peak > state.full_scale_ref * grow_threshold {
+                        state.full_scale_ref = observed_peak;
+                    }
+                }
                 // CPU-side log-frequency grid (fallback / visible reference)
                 let max_f = (sample_rate / 2.0).max(min_freq + 1.0);
                 let log_min = min_freq.max(1.0).log10();
@@ -180,17 +243,25 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                     );
                 }
 
-                // Horizontal dB reference lines (centered at 0 dB)
-                // 0 dB at center of rect, then +6, +12 above and -6, -12 below.
-                let scale_factor = 8.0_f32; // ピクセルあたりのdb(幅)
-                let y0 = rect.top() + rect.height() / 2.0;
-                let db_lines = [12.0_f32, 6.0, 0.0, -6.0, -12.0];
-                for &db in &db_lines {
-                    let y = y0 - db * scale_factor;
+                // Horizontal dB reference lines at absolute dBFS values.
+                // Draw fixed 20 dB steps across the configured display range
+                // [state.min_db, state.max_db]. This makes the grid independent
+                // of screen size or the current waveform: 0 dB corresponds to
+                // full-scale (0 dBFS) and will be placed accordingly.
+                let db_min = state.min_db;
+                let db_max = state.max_db;
+                let db_range = (db_max - db_min).max(1.0);
+                let step_db = 20.0_f32; // fixed 20 dB spacing
+                let start_mul = (db_min / step_db).floor() as i32;
+                let end_mul = (db_max / step_db).ceil() as i32;
+                for m in start_mul..=end_mul {
+                    let db = (m as f32) * step_db;
+                    let normalized = ((db - db_min) / db_range).clamp(0.0, 1.0);
+                    let y = rect.bottom() - normalized * rect.height();
                     let p1 = egui::pos2(rect.left(), y);
                     let p2 = egui::pos2(rect.right(), y);
-                    let color = if db == 0.0 {
-                        egui::Color32::from_rgb(255, 200, 50) // highlight 0dB
+                    let color = if (db - 0.0).abs() < std::f32::EPSILON {
+                        egui::Color32::from_rgb(255, 200, 50)
                     } else {
                         egui::Color32::from_gray(100)
                     };
@@ -228,23 +299,45 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
 
                         // map freq to bin (centered)
                         let bin_pos = freq / (sr / fft_n as f32) - 0.5;
-                        let bin_idx0 = bin_pos.floor() as isize;
-                        let bin_idx1 = bin_pos.ceil() as isize;
-                        let frac = bin_pos - bin_idx0 as f32;
+                        // Use linear interpolation between bins to avoid sudden
+                        // vertical drops caused by nearest-bin sampling.
+                        // This keeps the line continuous without 90-degree bends.
+                        let val = {
+                            let bin_idx0 = bin_pos.floor() as isize;
+                            let bin_idx1 = bin_pos.ceil() as isize;
+                            let frac = bin_pos - bin_idx0 as f32;
 
-                        let v0 = if bin_idx0 >= 0 && (bin_idx0 as usize) < smoothed_fft.len() {
-                            smoothed_fft[bin_idx0 as usize]
-                        } else {
-                            0.0
-                        };
-                        let v1 = if bin_idx1 >= 0 && (bin_idx1 as usize) < smoothed_fft.len() {
-                            smoothed_fft[bin_idx1 as usize]
-                        } else {
-                            0.0
+                            let v0 = if bin_idx0 >= 0 && (bin_idx0 as usize) < smoothed_fft.len() {
+                                smoothed_fft[bin_idx0 as usize]
+                            } else {
+                                0.0
+                            };
+                            let v1 = if bin_idx1 >= 0 && (bin_idx1 as usize) < smoothed_fft.len() {
+                                smoothed_fft[bin_idx1 as usize]
+                            } else {
+                                0.0
+                            };
+
+                            v0 * (1.0 - frac) + v1 * frac
                         };
 
-                        let val = v0 * (1.0 - frac) + v1 * frac;
-                        let mag_db = 20.0 * val.max(1e-12).log10();
+                        // Use absolute magnitude for dBFS calculation (handle negative values)
+                        let mag_db = 20.0 * (val.abs() / state.full_scale_ref).max(1e-12).log10();
+                        let denom = (state.max_db - state.min_db).max(1e-6);
+                        let mut norm = ((mag_db - state.min_db) / denom).clamp(0.0, 1.0);
+                        let x = rect.left() + t * w;
+                        let mut y = rect.bottom() - norm * h;
+                        // snap near-zero to exact bottom for visual continuity
+                        if norm <= 1e-6 {
+                            norm = 0.0;
+                            y = rect.bottom();
+                        }
+
+                        if norm > display_threshold {
+                            pixel_points[px] = Some(egui::pos2(x, y));
+                        }
+                        // Use absolute magnitude for dBFS calculation (handle negative values)
+                        let mag_db = 20.0 * (val.abs() / state.full_scale_ref).max(1e-12).log10();
                         let denom = (state.max_db - state.min_db).max(1e-6);
                         let mut norm = ((mag_db - state.min_db) / denom).clamp(0.0, 1.0);
                         let x = rect.left() + t * w;
@@ -262,7 +355,7 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                     
 
                     // find contiguous segments of Some points and draw each segment
-                    let stroke = egui::Stroke::new(1.6, egui::Color32::from_rgb(0, 200, 255));
+                    let stroke = egui::Stroke::new(1.6, egui::Color32::from_rgb(198, 198, 198));
                     let mut idx = 0usize;
                     while idx < n_pixels {
                         // skip None
@@ -290,7 +383,14 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                             seg_points.push(pixel_points[p].unwrap());
                         }
 
-                        // draw the visible polyline
+                        // 線グラフの中の塗りつぶし
+                        let fill_color = egui::Color32::from_rgba_unmultiplied(226, 226, 226, 50);
+                        for p in &seg_points {
+                            let bottom = egui::pos2(p.x, rect.bottom());
+                            ui.painter().line_segment([*p, bottom], egui::Stroke::new(1.0, fill_color));
+                        }
+
+                        // draw the visible polyline on top
                         ui.painter().add(egui::Shape::line(seg_points.clone(), stroke));
 
                         // Do not draw vertical drops inside the visible rect for
@@ -316,6 +416,7 @@ struct SpectrumPainter {
     min_freq: f32,        // lower bound for log mapping (e.g. 20.0)
     min_db: f32,
     max_db: f32,
+    full_scale_ref: f32,
 }
 
 // Pipeline cache
@@ -445,8 +546,9 @@ impl egui_wgpu::CallbackTrait for SpectrumPainter {
             // x in pixels within clip
             let px_x = clip_min.x + t * px_w;
 
-            // convert magnitude (assumed linear magnitude) to dB then normalize to 0..1
-            let mag_db = 20.0 * mag.max(1e-12).log10();
+            // convert magnitude (assumed linear amplitude) to dB relative to FS ref
+            // use absolute value in case mag can be negative
+            let mag_db = 20.0 * (mag.abs() / self.full_scale_ref).max(1e-12).log10();
             let norm = ((mag_db - self.min_db) / (self.max_db - self.min_db)).clamp(0.0, 1.0);
 
             // y in pixels (top=clip_min.y)
