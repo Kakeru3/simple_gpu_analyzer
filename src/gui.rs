@@ -50,8 +50,8 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
         prev_fft: Vec<f32>,
         min_db: f32,
         max_db: f32,
+        // Full-scale reference tracked internally via EMA (no GUI control)
         full_scale_ref: f32,
-        calibrate_now: bool,
             // Smoothing for the spectral display (number of bins in moving average).
             // 1 => no smoothing, 3 => small smoothing, etc.
             smoothing_bins: usize,
@@ -64,7 +64,10 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
         fn new(fft: Arc<Mutex<Vec<f32>>>) -> Self {
             // initialize prev_fft from current buffer (or empty)
             let initial = fft.lock().clone();
-            Self { fft, prev_fft: initial, min_db: -16.0, max_db: 64.0, full_scale_ref: 1.0, calibrate_now: false, smoothing_bins: 1 }
+            // default: max_db fixed at +5 dB, min_db default -60 dB
+            // initialize full_scale_ref from the current buffer peak (fallback to 1e-6)
+            let init_peak = initial.iter().map(|v| v.abs()).fold(1e-6_f32, f32::max);
+            Self { fft, prev_fft: initial, min_db: -60.0, max_db: 5.0, full_scale_ref: init_peak, smoothing_bins: 1 }
         }
     }
 
@@ -84,20 +87,12 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                 // dB range sliders + full-scale calibration
                 ui.horizontal(|ui| {
                     ui.label("dB range:");
-                    ui.add(egui::Slider::new(&mut state.min_db, -120.0..=0.0).text("min dB"));
-                    ui.add(egui::Slider::new(&mut state.max_db, 0.0..=60.0).text("max dB"));
+                    // max_db is fixed to +5 dB; allow the user to move only min_db
+                    ui.add(egui::Slider::new(&mut state.min_db, -120.0..=5.0).text("min dB"));
+                    // ui.label(format!("max dB: {} dB", state.max_db));
                     ui.separator();
-                    ui.label("FS ref:");
-                    // Allow a much wider range for full-scale reference because
-                    // FFT magnitudes may not be normalized to 1.0. Hosts or windowing
-                    // can produce peak values > 4. Allow up to 1e6 here; user can
-                    // still type arbitrary values if needed.
-                    ui.add(egui::DragValue::new(&mut state.full_scale_ref).speed(0.01).range(1e-6..=1e6));
-                    if ui.button("Calibrate FS").clicked() {
-                        // schedule calibration to run after we compute smoothed_fft
-                        state.calibrate_now = true;
-                    }
-                    ui.label("(full-scale amplitude for 0 dB)");
+                    // Full-scale reference UI removed. Full-scale is provided
+                    // / normalized on the audio side; GUI assumes 1.0 = 0 dBFS.
                 });
 
                 // Controls for display smoothing (spectral smoothing only)
@@ -196,31 +191,17 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                     }
                 };
 
-                // If user requested calibration, use the smoothed FFT peak
-                // so the UI's "Calibrate FS" aligns with the plotted (smoothed)
-                // data rather than an instantaneous raw peak.
-                if state.calibrate_now {
-                    if !smoothed_fft.is_empty() {
-                        // Use absolute magnitudes when finding peak so negative values
-                        // do not reduce the measured full-scale reference.
-                        let peak = smoothed_fft.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
-                        if peak > 1e-12 {
-                            state.full_scale_ref = peak;
-                        }
-                    }
-                    state.calibrate_now = false;
-                }
-
-                // Automatic calibration: if the observed smoothed peak grows beyond
-                // the current full-scale reference by a small margin, expand the
-                // reference automatically so 0 dB remains a clipping indicator.
-                // We use a small hysteresis (e.g. 2%) to avoid jitter from tiny peaks.
+                // GUI-side calibration removed. Instead, track a long-term
+                // full-scale reference internally via an exponential moving
+                // average (EMA). This keeps the GUI immutable while allowing
+                // the display to follow slowly-changing overall levels.
                 if !smoothed_fft.is_empty() {
                     let observed_peak = smoothed_fft.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
-                    let grow_threshold = 1.02_f32; // require >2% growth to update
-                    if observed_peak > state.full_scale_ref * grow_threshold {
-                        state.full_scale_ref = observed_peak;
-                    }
+                    // EMA alpha close to 1 for very slow tracking (long-term)
+                    let ema_alpha = 0.995_f32;
+                    // floor observed to avoid collapse to zero
+                    let observed = observed_peak.max(1e-12_f32);
+                    state.full_scale_ref = (ema_alpha * state.full_scale_ref + (1.0 - ema_alpha) * observed).max(1e-12_f32);
                 }
                 // CPU-side log-frequency grid (fallback / visible reference)
                 let max_f = (sample_rate / 2.0).max(min_freq + 1.0);
@@ -251,7 +232,7 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                 let db_min = state.min_db;
                 let db_max = state.max_db;
                 let db_range = (db_max - db_min).max(1.0);
-                let step_db = 20.0_f32; // fixed 20 dB spacing
+                let step_db = 5.0_f32; // スペース
                 let start_mul = (db_min / step_db).floor() as i32;
                 let end_mul = (db_max / step_db).ceil() as i32;
                 for m in start_mul..=end_mul {
@@ -336,21 +317,6 @@ pub fn create(fft_data: Arc<Mutex<Vec<f32>>>) -> Option<Box<dyn Editor>> {
                         if norm > display_threshold {
                             pixel_points[px] = Some(egui::pos2(x, y));
                         }
-                        // Use absolute magnitude for dBFS calculation (handle negative values)
-                        let mag_db = 20.0 * (val.abs() / state.full_scale_ref).max(1e-12).log10();
-                        let denom = (state.max_db - state.min_db).max(1e-6);
-                        let mut norm = ((mag_db - state.min_db) / denom).clamp(0.0, 1.0);
-                        let x = rect.left() + t * w;
-                        let mut y = rect.bottom() - norm * h;
-                        // snap near-zero to exact bottom for visual continuity
-                        if norm <= 1e-6 {
-                            norm = 0.0;
-                            y = rect.bottom();
-                        }
-
-                        if norm > display_threshold {
-                            pixel_points[px] = Some(egui::pos2(x, y));
-                        }
                     }
                     
 
@@ -413,7 +379,7 @@ struct SpectrumPainter {
     data: Vec<f32>,       // normalized magnitudes 0..1 (from process())
     sample_rate: f32,     // e.g. 44100.0
     fft_size: usize,      // e.g. 4096 etc. (we heuristically use data.len()*2 if not provided)
-    min_freq: f32,        // lower bound for log mapping (e.g. 20.0)
+    min_freq: f32,        // lower bound for log mapping 
     min_db: f32,
     max_db: f32,
     full_scale_ref: f32,

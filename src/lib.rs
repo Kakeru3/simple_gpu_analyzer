@@ -3,7 +3,6 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 mod gui;
-mod gpui;
 
 #[derive(Params)]
 struct EmptyParams {}
